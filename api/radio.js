@@ -1,12 +1,13 @@
-// api/radio.js — Unified Cross-Engine Smart Radio (JioSaavn 320K + YouTube Music)
+// api/radio.js — Precision Cross-Engine Smart Radio (No 1-Hour Mixes, Exact Vibe Match)
 const SAAVN_BASE = "https://jio-saavn-api-self.vercel.app";
 const YT_BASE = "https://yt-music-api-indol.vercel.app";
 
+const JUNK_PATTERNS = /\b(1\s*hour|2\s*hour|mix|compilation|reaction|mashup|jukebox|non\s*stop|24\/7|live|study\s*session|playlist|top\s*100|top\s*150|top\s*40)\b/i;
+
 const MOOD_KEYWORDS = [
   "phonk", "slowed", "reverb", "lofi", "lo-fi", "sad", "romantic", "love",
-  "punjabi", "hindi", "haryanvi", "bhojpuri", "english", "drill", "trap",
-  "remix", "mashup", "unplugged", "acoustic", "party", "workout", "gym",
-  "bass", "nightcore", "sped up", "instrumental", "rap", "hip hop", "indie"
+  "punjabi", "hindi", "sufi", "ghazal", "haryanvi", "english", "drill", "trap",
+  "unplugged", "acoustic", "party", "workout", "gym", "bass", "rap", "indie"
 ];
 
 function cleanText(str = "") {
@@ -20,9 +21,7 @@ function cleanText(str = "") {
 }
 
 function getNormalizedKey(title = "", artist = "") {
-  const t = cleanText(title);
-  const a = cleanText(artist.split(",")[0] || "");
-  return `${t}::${a}`;
+  return `${cleanText(title)}::${cleanText(artist.split(",")[0] || "")}`;
 }
 
 function extractMoodTags(title = "", artist = "") {
@@ -30,8 +29,18 @@ function extractMoodTags(title = "", artist = "") {
   return MOOD_KEYWORDS.filter(tag => combined.includes(tag));
 }
 
+function isJunkOrLongMix(title = "", durationSec = 0) {
+  if (JUNK_PATTERNS.test(title)) return true;
+  if (durationSec > 660) return true; // Block anything longer than 11 minutes
+  return false;
+}
+
 function normalizeSaavnTrack(item) {
   if (!item || !item.id) return null;
+  const title = (item.name || item.title || "").replace(/&quot;/g, '"').replace(/&amp;/g, "&").trim();
+  const duration = Number(item.duration || 0);
+  if (!title || isJunkOrLongMix(title, duration)) return null;
+
   const imgArr = Array.isArray(item.image) ? item.image : [];
   const bestImg = imgArr[imgArr.length - 1]?.url || imgArr[0]?.url || item.image || "";
   const dlArr = Array.isArray(item.downloadUrl) ? item.downloadUrl : [];
@@ -40,11 +49,12 @@ function normalizeSaavnTrack(item) {
 
   return {
     id: String(item.id),
-    title: (item.name || item.title || "Unknown").replace(/&quot;/g, '"').replace(/&amp;/g, "&"),
+    title,
     artist: primaryArtists.replace(/&amp;/g, "&"),
     image: bestImg,
     url: bestUrl,
-    duration: Number(item.duration || 0),
+    duration,
+    language: (item.language || "").toLowerCase(),
     engine: "saavn"
   };
 }
@@ -52,6 +62,10 @@ function normalizeSaavnTrack(item) {
 function normalizeYTTrack(item) {
   const vid = item?.videoId || item?.id;
   if (!vid) return null;
+  const title = (item.title || item.name || "").trim();
+  const duration = Number(item.duration_seconds || item.duration || 0);
+  if (!title || isJunkOrLongMix(title, duration)) return null;
+
   const thumbs = Array.isArray(item.thumbnails) ? item.thumbnails : [];
   const bestImg = thumbs[thumbs.length - 1]?.url || item.thumbnail || `https://i.ytimg.com/vi/${vid}/hqdefault.jpg`;
   const artists = Array.isArray(item.artists)
@@ -60,11 +74,12 @@ function normalizeYTTrack(item) {
 
   return {
     id: String(vid),
-    title: item.title || item.name || "Unknown",
+    title,
     artist: artists,
     image: bestImg,
     url: "",
-    duration: Number(item.duration_seconds || item.duration || 0),
+    duration,
+    language: "",
     engine: "yt"
   };
 }
@@ -93,7 +108,7 @@ export default async function handler(req, res) {
     const body = req.method === "POST" ? (req.body || {}) : {};
     const seed = body.seedTrack || {
       id: req.query.id || "",
-      title: req.query.title || "Trending Hindi",
+      title: req.query.title || "",
       artist: req.query.artist || "",
       engine: req.query.engine || "saavn"
     };
@@ -107,26 +122,23 @@ export default async function handler(req, res) {
     const primaryArtist = (seed.artist || "").split(",")[0].trim();
     const seedTags = extractMoodTags(seed.title, seed.artist);
     const vibeHint = seedTags[0] || "";
-    const crossQuery = encodeURIComponent(`${cleanText(seed.title)} ${primaryArtist} ${vibeHint}`.trim());
-    const artistQuery = encodeURIComponent(`${primaryArtist} ${vibeHint}`.trim());
+    const songTitleClean = cleanText(seed.title);
 
-    // STAGE 1: Parallel Cross-Engine Harvesting (Both Saavn & YT fetched together!)
+    // Parallel Cross-Engine Queries focused on Seed Artist + Exact Song Vibe
     const tasks = [];
 
-    // 1A. Saavn Native Co-Listening Graph OR Cross-Search
     if (seed.engine === "saavn" && seed.id) {
-      tasks.push(safeFetchJson(`${SAAVN_BASE}/api/songs/${encodeURIComponent(seed.id)}/suggestions?limit=20`));
+      tasks.push(safeFetchJson(`${SAAVN_BASE}/api/songs/${encodeURIComponent(seed.id)}/suggestions?limit=25`));
     }
-    tasks.push(safeFetchJson(`${SAAVN_BASE}/api/search/songs?query=${artistQuery || crossQuery}&limit=16`));
-
-    // 1B. YT Music Radio Mix (RDAMVM) OR Cross-Search
+    if (primaryArtist) {
+      tasks.push(safeFetchJson(`${SAAVN_BASE}/api/search/songs?query=${encodeURIComponent(primaryArtist)}&limit=15`));
+      tasks.push(safeFetchJson(`${YT_BASE}/search?q=${encodeURIComponent(`${primaryArtist} ${songTitleClean} song`)}&filter=songs`));
+    }
+    if (songTitleClean) {
+      tasks.push(safeFetchJson(`${SAAVN_BASE}/api/search/songs?query=${encodeURIComponent(`${songTitleClean} ${vibeHint}`.trim())}&limit=12`));
+    }
     if (seed.engine === "yt" && seed.id) {
       tasks.push(safeFetchJson(`${YT_BASE}/radio?videoId=${encodeURIComponent(seed.id)}`));
-      tasks.push(safeFetchJson(`${YT_BASE}/watch?videoId=${encodeURIComponent(seed.id)}`));
-    }
-    tasks.push(safeFetchJson(`${YT_BASE}/search?q=${crossQuery}&filter=songs`));
-    if (artistQuery && artistQuery !== crossQuery) {
-      tasks.push(safeFetchJson(`${YT_BASE}/search?q=${artistQuery}&filter=songs`));
     }
 
     const results = await Promise.allSettled(tasks);
@@ -136,7 +148,6 @@ export default async function handler(req, res) {
       if (r.status !== "fulfilled" || !r.value) continue;
       const payload = r.value;
 
-      // Parse Saavn structures
       const saavnList = payload?.data?.results || (Array.isArray(payload?.data) ? payload.data : null);
       if (Array.isArray(saavnList)) {
         saavnList.forEach(item => {
@@ -145,7 +156,6 @@ export default async function handler(req, res) {
         });
       }
 
-      // Parse YT structures
       const ytList = payload?.tracks || payload?.results || (Array.isArray(payload) ? payload : null);
       if (Array.isArray(ytList)) {
         ytList.forEach(item => {
@@ -155,67 +165,59 @@ export default async function handler(req, res) {
       }
     }
 
-    // STAGE 2: Cross-Engine Deduplication (Keep Saavn 320K if same song exists on both!)
+    // Deduplicate (Upgrade YT duplicates to Saavn 320K)
     const dedupMap = new Map();
     const seedKey = getNormalizedKey(seed.title, seed.artist);
 
     for (const track of rawPool) {
-      if (!track || !track.id) continue;
-      if (String(track.id) === String(seed.id)) continue;
+      if (!track || !track.id || String(track.id) === String(seed.id)) continue;
       if (recentIds.has(String(track.id))) continue;
 
       const key = getNormalizedKey(track.title, track.artist);
       if (!key || key === seedKey || recentKeys.has(key)) continue;
 
       const existing = dedupMap.get(key);
-      if (!existing) {
-        dedupMap.set(key, track);
-      } else if (existing.engine === "yt" && track.engine === "saavn" && track.url) {
-        // Upgrade duplicate YT track to crisp 320K Saavn version
+      if (!existing || (existing.engine === "yt" && track.engine === "saavn" && track.url)) {
         dedupMap.set(key, track);
       }
     }
 
-    // STAGE 3: Spotify-Style Taste & Vibe Scoring (Engine-Agnostic)
+    // Score strictly by Seed Artist, Co-Listened Graph, Mood Tags & Skip History
     const scored = [];
-    const seedTitleTokens = new Set(cleanText(seed.title).split(" ").filter(w => w.length > 2));
-
     for (const track of dedupMap.values()) {
-      let score = 40; // Base score for both Saavn & YT equally
+      let score = 35;
       const tArtistLower = track.artist.toLowerCase();
       const tPrimaryArtist = tArtistLower.split(",")[0].trim();
       const tTags = extractMoodTags(track.title, track.artist);
 
-      // +35 Vibe & Mood Tag Overlap (phonk, slowed, romantic, punjabi, etc.)
-      const sharedTags = tTags.filter(tag => seedTags.includes(tag));
-      score += Math.min(35, sharedTags.length * 18);
-
-      // +20 Title/Style Keyword Synergy
-      const tTokens = cleanText(track.title).split(" ");
-      const tokenOverlap = tTokens.filter(w => seedTitleTokens.has(w)).length;
-      score += Math.min(20, tokenOverlap * 7);
-
-      // +22 Artist Affinity (Same/Featured Artist OR User's Liked Artists)
+      // Strong boost for same/related artist (e.g., Satinder Sartaaj -> Punjabi Sufi/Folk peers)
       if (primaryArtist && tArtistLower.includes(primaryArtist.toLowerCase())) {
-        score += 18;
-      }
-      if (likedArtists.some(la => la && tArtistLower.includes(la))) {
-        score += 22;
+        score += 32;
       }
 
-      // -50 Skip Penalty (Negative Behavioral Signal)
-      if (skippedIds.has(String(track.id))) score -= 60;
-      if (skippedArtists.has(tPrimaryArtist)) score -= 40;
+      // Mood tag alignment (phonk stays phonk, sufi/punjabi stays sufi/punjabi)
+      const sharedTags = tTags.filter(tag => seedTags.includes(tag));
+      score += Math.min(30, sharedTags.length * 16);
 
-      // Slight jitter (+0 to +6) so radio feels organic every session
-      score += Math.random() * 6;
+      // Penalize mismatching extreme genres (e.g., don't put Dark Phonk after Satinder Sartaaj!)
+      const isSeedHard = seedTags.some(t => ["phonk", "drill", "trap", "gym", "workout", "bass"].includes(t));
+      const isTrackHard = tTags.some(t => ["phonk", "drill", "trap", "gym", "workout", "bass"].includes(t));
+      if (isSeedHard !== isTrackHard) score -= 45;
 
+      // User's Liked Artists synergy
+      if (likedArtists.some(la => la && tArtistLower.includes(la))) score += 16;
+
+      // Early Skip Penalty
+      if (skippedIds.has(String(track.id))) score -= 65;
+      if (skippedArtists.has(tPrimaryArtist)) score -= 45;
+
+      score += Math.random() * 5;
       scored.push({ track, score, primaryArtist: tPrimaryArtist });
     }
 
     scored.sort((a, b) => b.score - a.score);
 
-    // STAGE 4: Artist-Cooldown Sequencer (Never play same artist back-to-back)
+    // Artist-Cooldown Sequencer
     const finalQueue = [];
     const recentQueuedArtists = [];
 
@@ -230,11 +232,7 @@ export default async function handler(req, res) {
       if (recentQueuedArtists.length > 2) recentQueuedArtists.shift();
     }
 
-    return res.status(200).json({
-      ok: true,
-      count: finalQueue.length,
-      tracks: finalQueue
-    });
+    return res.status(200).json({ ok: true, count: finalQueue.length, tracks: finalQueue });
   } catch (err) {
     return res.status(500).json({ ok: false, error: err.message, tracks: [] });
   }
